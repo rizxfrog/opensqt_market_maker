@@ -15,11 +15,11 @@ import (
 
 const (
 	okxInstTypeSwap  = "SWAP"
-	okxTDModeCross   = "cross"
-	okxPosModeHedge  = "long_short_mode"
-	okxPublicWSURL   = "wss://ws.okx.com:8443/ws/v5/public"
-	okxPrivateWSURL  = "wss://ws.okx.com:8443/ws/v5/private"
-	okxBusinessWSURL = "wss://ws.okx.com:8443/ws/v5/business"
+	okxTDModeCross   = "cross"                                // cross:全仓  isolated:逐仓
+	okxPosModeHedge  = "long_short_mode"                      // long_short_mode:双向持仓模式  net_mod:单向持仓模式
+	okxPublicWSURL   = "wss://ws.okx.com:8443/ws/v5/public"   // 公共通道地址
+	okxPrivateWSURL  = "wss://ws.okx.com:8443/ws/v5/private"  // 私人通道地址
+	okxBusinessWSURL = "wss://ws.okx.com:8443/ws/v5/business" // 业务通道地址
 )
 
 type OKXAdapter struct {
@@ -27,6 +27,8 @@ type OKXAdapter struct {
 	wsManager      *WebSocketManager
 	klineWSManager *KlineWebSocketManager
 
+	// symbol 是仓库内部使用的交易对，例如 ETHUSDT。
+	// instID 是 OKX API 需要的永续合约标识，例如 ETH-USDT-SWAP。
 	symbol           string
 	instID           string
 	tdMode           string
@@ -80,6 +82,8 @@ func (o *OKXAdapter) GetName() string {
 }
 
 func convertToOKXSwapInstID(symbol string) string {
+	// 代码库其他部分使用紧凑格式的交易对符号，例如 ETHUSDT。
+	// OKX SWAP 端点需要 BASE-QUOTE-SWAP 格式的 instId。
 	upper := strings.ToUpper(strings.TrimSpace(symbol))
 	if strings.HasSuffix(upper, "-SWAP") {
 		return upper
@@ -94,6 +98,8 @@ func convertToOKXSwapInstID(symbol string) string {
 }
 
 func mapOrderIntent(side Side, reduceOnly bool) (string, string, error) {
+	// 在 OKX long_short_mode 模式下，side 和 posSide 共同定义交易意图：
+	// buy+long=开多，sell+long=平多，sell+short=开空，buy+short=平空。
 	switch side {
 	case SideBuy:
 		if reduceOnly {
@@ -128,6 +134,8 @@ func normalizeOrderState(state string) OrderStatus {
 }
 
 func contractsFromBaseQuantity(baseQty, contractSz, step float64) (string, error) {
+	// 策略使用基础资产数量，但 OKX 订单大小以合约张数表示。
+	// 向下舍入到最接近的有效步长，以避免订单被拒绝。
 	if baseQty <= 0 || contractSz <= 0 || step <= 0 {
 		return "", fmt.Errorf("invalid quantity conversion input")
 	}
@@ -185,6 +193,8 @@ func normalizeKlineBar(interval string) string {
 }
 
 func parseOKXCandle(symbol string, raw []string) (*Candle, error) {
+	// OKX K 线数据是字符串元组：
+	// [ts, open, high, low, close, vol, volCcy, volCcyQuote, confirm]
 	if len(raw) < 6 {
 		return nil, fmt.Errorf("invalid candle payload")
 	}
@@ -211,6 +221,8 @@ func parseOKXCandle(symbol string, raw []string) (*Candle, error) {
 }
 
 func (o *OKXAdapter) fetchInstrumentInfo(ctx context.Context) error {
+	// 合约元数据驱动后续所有转换：
+	// tick size 用于价格格式化，lot size 用于合约步长，ctVal 用于基础数量与合约张数之间的转换。
 	query := url.Values{}
 	query.Set("instType", okxInstTypeSwap)
 	query.Set("instId", o.instID)
@@ -264,6 +276,7 @@ func (o *OKXAdapter) fetchInstrumentInfo(ctx context.Context) error {
 }
 
 func (o *OKXAdapter) fetchAccountConfig(ctx context.Context) error {
+	// 当前版本仅支持双向持仓模式。此处快速失败可避免后续订单方向出现隐性错误。
 	data, err := o.client.DoRequest(ctx, "GET", "/api/v5/account/config", nil, nil)
 	if err != nil {
 		return fmt.Errorf("fetch OKX account config: %w", err)
@@ -309,11 +322,13 @@ func (o *OKXAdapter) convertContractsToBase(contracts string) float64 {
 }
 
 func (o *OKXAdapter) PlaceOrder(ctx context.Context, req *OrderRequest) (*Order, error) {
+	// 将策略的 side/reduceOnly 模型转换为 OKX 双向持仓模式字段。
 	side, posSide, err := mapOrderIntent(req.Side, req.ReduceOnly)
 	if err != nil {
 		return nil, err
 	}
 
+	// OKX 的 `sz` 参数需要合约张数，而不是基础资产数量。
 	contracts, err := contractsFromBaseQuantity(req.Quantity, o.contractValue, o.contractStep)
 	if err != nil {
 		return nil, err
@@ -527,6 +542,7 @@ func (o *OKXAdapter) mapRESTOrder(order okxRestOrder) *Order {
 }
 
 func (o *OKXAdapter) GetAccount(ctx context.Context) (*Account, error) {
+	// 余额和持仓数据来自不同的 OKX 端点；在此处组装为适配器对外公开的 Account 结构。
 	query := url.Values{}
 	query.Set("ccy", o.quoteAsset)
 	data, err := o.client.DoRequest(ctx, "GET", "/api/v5/account/balance", query, nil)
@@ -571,6 +587,7 @@ func (o *OKXAdapter) GetAccount(ctx context.Context) (*Account, error) {
 }
 
 func (o *OKXAdapter) GetPositions(ctx context.Context, symbol string) ([]*Position, error) {
+	// OKX 返回的持仓大小以合约张数表示。需要转换回基础资产数量，以便策略其余部分保持交易所无关。
 	query := url.Values{}
 	query.Set("instType", okxInstTypeSwap)
 	query.Set("instId", o.instID)
@@ -672,6 +689,7 @@ func (o *OKXAdapter) StopKlineStream() error {
 }
 
 func (o *OKXAdapter) GetHistoricalKlines(ctx context.Context, symbol string, interval string, limit int) ([]*Candle, error) {
+	// history-candles 返回的数据是最新到最旧；需要反转，以便下游代码接收最旧到最新的顺序。
 	query := url.Values{}
 	query.Set("instId", convertToOKXSwapInstID(symbol))
 	query.Set("bar", normalizeKlineBar(interval))
